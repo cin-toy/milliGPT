@@ -41,30 +41,45 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.block_size = config.block_size
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                .view(1, 1, config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # TODO: get previous k and v from cache (kv_cache) and concat to the current k and v
+        if kv_cache:
+            prev_k, prev_v = kv_cache
+            k = torch.cat([prev_k, k], dim=1)
+            v = torch.cat([prev_v, v], dim=1)
+
+        # TODO: update new k and v and return
+        kv_cache = [k, v]
+
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs) with T = 1
+        k = k.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        current_T = k.size(2)
+        assert current_T <= self.block_size, f"Cannot forward sequence of length {current_T}, block size is only {self.block_size}"
 
         # manual implementation of attention
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = att.masked_fill(self.bias[:, :, current_T - T:current_T, :current_T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
+        
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        
+        return y, kv_cache
 
 class MLP(nn.Module):
 
@@ -91,10 +106,13 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, kv_cache=None):
+        # TODO: return kv_cache at each block
+        attn_logits, kv_cache = self.attn(self.ln_1(x), kv_cache)
+
+        x = x + attn_logits
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, kv_cache
 
 @dataclass
 class GPTConfig:
@@ -158,21 +176,37 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, kv_cache=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
+        
+        # TODO: initialize kv_cache + update pos corresponding timestep t
+        if kv_cache:
+            start_pos = idx.size(1) - 1
+            pos = torch.arange(start_pos, start_pos + 1, dtype=torch.long, device=device)
+            idx = idx[:, [-1]]
+        
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        
-        for block in self.transformer.h:
-            x = block(x)
+    
+        # TODO: update kv_cache after each transformer block
+        new_kv_cache = []
+        if kv_cache:
+            x_output = None
+            for block, kv_cache_block in zip(self.transformer.h, kv_cache):
+                x, kv_cache = block(x, kv_cache_block)
+                new_kv_cache.append(kv_cache)
+                x_output = torch.cat([x_output, x], dim=1) if x_output is not None else x
+            x = x_output
+        else:
+            for block in self.transformer.h:
+                x, _ = block(x)
         x = self.transformer.ln_f(x)
-
+        
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
@@ -181,8 +215,11 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
-
-        return logits, loss
+        
+        if len(new_kv_cache) > 0:
+            return logits, loss, new_kv_cache
+        else:
+            return logits, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -295,27 +332,65 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        def sampling_generation(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
+            """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
+                Args:
+                    logits: logits distribution shape (vocabulary size)
+                    top_k >0: keep only top k tokens with highest probability (top-k filtering).
+                    top_p >0.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
+            """
+            assert logits.size(0) == 1  # batch size = 1
+            top_k = min(top_k, logits.size(-1))  # Safety check
+            if top_k > 0:
+                # Remove all tokens with a probability less than the last token of the top-k
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][:, -1].unsqueeze(0)
+                logits[indices_to_remove] = filter_value
+
+            if top_p > 0.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep also the first token above the threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                # indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                indices_to_remove = torch.zeros_like(logits, dtype=sorted_indices_to_remove.dtype).scatter_(
+                                                    dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+                logits[indices_to_remove] = filter_value
+            return logits
+        
+        # TODO: initialize kv_cache for forward pass
+        kv_cache = [None] * self.config.n_layer
+
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, kv_cache = self(idx_cond, kv_cache=kv_cache)
             logits = logits[:, -1, :] # crop to just the final time step
-            
             if temperature == 0.0:
                 # "sample" the single most likely index
                 _, idx_next = torch.topk(logits, k=1, dim=-1)
             else:
                 # implement your top-k sampling here
-                raise NotImplementedError("temperature > 0 is not implemented")
+                # raise NotImplementedError("temperature > 0 is not implemented")
+                ## TODO: implement temperature, top-k, and top-p
+                logits = logits / temperature
+                filtered_logits = sampling_generation(logits, top_k=top_k, top_p=top_p)
+                # Sample from the filtered distribution
+                probabilities = F.softmax(filtered_logits, dim=-1)
+                idx_next = torch.multinomial(probabilities, 1)
                 
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-
+        
         return idx
